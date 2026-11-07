@@ -1,0 +1,58 @@
+name: ARC manager end-to-end
+run-name: arc-manager-e2e-${{ inputs.nonce }}
+on:
+  workflow_dispatch:
+    inputs:
+      pool:
+        description: Repository-bound ARC pool name
+        required: true
+        type: string
+      nonce:
+        description: Unique non-secret test marker
+        required: true
+        type: string
+      expect_cache:
+        description: Expected retained PVC cache state
+        required: false
+        default: any
+        type: choice
+        options: [any, cold, hit]
+permissions:
+  contents: read
+jobs:
+  probe:
+    timeout-minutes: 5
+    runs-on: ${{ inputs.pool }}
+    env:
+      E2E_NONCE: ${{ inputs.nonce }}
+      E2E_EXPECT_CACHE: ${{ inputs.expect_cache }}
+    steps:
+      - name: Verify runner identity and retained build cache
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf 'Runner: %s\n' "$RUNNER_NAME"
+          uname -sm
+          test -n "${ARC_ARTIFACT_CACHE:-}"
+          test -w "$ARC_ARTIFACT_CACHE"
+          node_binary=''
+          for candidate in /home/runner/externals/node24/bin/node /home/runner/externals/node20/bin/node; do
+            if test -x "$candidate"; then node_binary="$candidate"; break; fi
+          done
+          if test -z "$node_binary"; then node_binary="$(command -v node)"; fi
+          export E2E_CACHE_FILE="$ARC_ARTIFACT_CACHE/arc-manager-e2e-v8.cache"
+          "$node_binary" <<'JS'
+          const fs = require('node:fs');
+          const vm = require('node:vm');
+          const source = 'function buildResult() { return 6 * 7; } buildResult();';
+          const file = process.env.E2E_CACHE_FILE;
+          const hit = fs.existsSync(file);
+          if (process.env.E2E_EXPECT_CACHE === 'cold' && hit) throw new Error('Expected empty test cache');
+          if (process.env.E2E_EXPECT_CACHE === 'hit' && !hit) throw new Error('Retained PVC cache was lost');
+          const script = new vm.Script(source, hit ? {cachedData: fs.readFileSync(file)} : {});
+          if (script.cachedDataRejected) throw new Error('Persisted build cache rejected');
+          const result = script.runInNewContext();
+          if (result !== 42) throw new Error('Build fixture failed');
+          if (!hit) fs.writeFileSync(file, script.createCachedData());
+          console.log(JSON.stringify({nonce: process.env.E2E_NONCE, runner: process.env.RUNNER_NAME, node: process.version, cacheHit: hit, result}));
+          JS
